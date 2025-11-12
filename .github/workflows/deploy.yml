@@ -1,0 +1,105 @@
+name: Deploy Lead Demo Sites
+
+on:
+  push:
+    paths:
+      - 'sites/**'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "Demo Bot"
+          git config user.email "bot@github.com"
+
+      - name: Detect New/Changed Sites
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            SITES=$(ls -d sites/*/ 2>/dev/null | xargs -n 1 basename || echo "")
+          else
+            SITES=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep '^sites/' | cut -d'/' -f2 | sort -u || echo "")
+          fi
+          echo "Found sites: $SITES"
+          echo "sites<<EOF" >> $GITHUB_OUTPUT
+          echo "$SITES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Deploy Sites to GitHub Pages
+        if: steps.changes.outputs.sites != ''
+        run: |
+          npm install -g gh-pages
+          
+          while IFS= read -r SITE; do
+            if [ -n "$SITE" ] && [ -d "sites/$SITE" ]; then
+              echo "📦 Deploying $SITE..."
+              
+              # Add metadata if missing
+              if [ ! -f "sites/$SITE/deployed.json" ]; then
+                echo "{\"deployed\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \"subdomain\": \"$SITE\"}" > sites/$SITE/deployed.json
+                git add sites/$SITE/deployed.json
+              fi
+              
+              # Deploy to gh-pages branch
+              gh-pages -d sites/$SITE -e $SITE -m "Deploy $SITE" --dotfiles
+              
+              echo "✅ $SITE deployed to https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/$SITE"
+            fi
+          done <<< "${{ steps.changes.outputs.sites }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commit Metadata
+        run: |
+          if git diff --staged --quiet; then
+            echo "No metadata to commit"
+          else
+            git commit -m "Update deployment metadata"
+            git push
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update DNS (if Cloudflare configured)
+        if: env.CF_API_TOKEN != '' && steps.changes.outputs.sites != ''
+        run: |
+          while IFS= read -r SITE; do
+            if [ -n "$SITE" ]; then
+              echo "🌐 Creating DNS for $SITE.${{ secrets.CF_DOMAIN }}"
+              
+              # Check if record exists
+              EXISTING=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/dns_records?name=$SITE.${{ secrets.CF_DOMAIN }}" \
+                -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+                -H "Content-Type: application/json" | jq -r '.result[0].id // empty')
+              
+              if [ -z "$EXISTING" ]; then
+                curl -X POST "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/dns_records" \
+                  -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+                  -H "Content-Type: application/json" \
+                  --data '{
+                    "type": "CNAME",
+                    "name": "'"$SITE"'",
+                    "content": "'"${{ github.repository_owner }}.github.io"'",
+                    "ttl": 1,
+                    "proxied": true
+                  }'
+                echo "✅ DNS created for $SITE"
+              else
+                echo "⏭️  DNS already exists for $SITE"
+              fi
+            fi
+          done <<< "${{ steps.changes.outputs.sites }}"
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
