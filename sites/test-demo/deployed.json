@@ -1,0 +1,9 @@
+{
+  "deployed": "2025-11-12T22:00:00Z",
+  "subdomain": "test-demo",
+  "lead": "Test Lead",
+  "customizations": {
+    "company_name": "Test Lead",
+    "industry": "Tech"
+  }
+}
