@@ -1,0 +1,129 @@
+name: Cleanup Old Demo Sites
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # Daily at 2 AM UTC
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Delete sites older than X days'
+        required: false
+        default: '7'
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Configure Git
+        run: |
+          git config user.name "Cleanup Bot"
+          git config user.email "cleanup@github.com"
+
+      - name: Find Expired Sites
+        id: expired
+        run: |
+          DAYS=${{ github.event.inputs.days || '7' }}
+          CUTOFF=$(date -u -d "$DAYS days ago" +%s)
+          EXPIRED=""
+          
+          echo "🔍 Looking for sites older than $DAYS days (cutoff: $(date -u -d "@$CUTOFF"))"
+          
+          for SITE_DIR in sites/*/; do
+            if [ -d "$SITE_DIR" ]; then
+              SITE=$(basename "$SITE_DIR")
+              
+              if [ -f "$SITE_DIR/deployed.json" ]; then
+                DEPLOYED=$(jq -r '.deployed' "$SITE_DIR/deployed.json")
+                TIMESTAMP=$(date -d "$DEPLOYED" +%s 2>/dev/null || echo 0)
+                
+                if [ $TIMESTAMP -lt $CUTOFF ]; then
+                  EXPIRED="$EXPIRED$SITE\n"
+                  echo "❌ $SITE is expired (deployed: $DEPLOYED)"
+                else
+                  echo "✅ $SITE is still active (deployed: $DEPLOYED)"
+                fi
+              else
+                echo "⚠️  $SITE has no metadata, marking for deletion"
+                EXPIRED="$EXPIRED$SITE\n"
+              fi
+            fi
+          done
+          
+          echo -e "sites<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$EXPIRED" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Delete Expired Sites from Repo
+        if: steps.expired.outputs.sites != ''
+        run: |
+          while IFS= read -r SITE; do
+            if [ -n "$SITE" ] && [ -d "sites/$SITE" ]; then
+              echo "🗑️  Deleting sites/$SITE"
+              git rm -rf "sites/$SITE"
+            fi
+          done <<< "${{ steps.expired.outputs.sites }}"
+          
+          if git diff --staged --quiet; then
+            echo "No sites to delete"
+          else
+            git commit -m "Cleanup: Remove expired demo sites"
+            git push
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete DNS Records
+        if: env.CF_API_TOKEN != '' && steps.expired.outputs.sites != ''
+        run: |
+          while IFS= read -r SITE; do
+            if [ -n "$SITE" ]; then
+              echo "🌐 Deleting DNS for $SITE.${{ secrets.CF_DOMAIN }}"
+              
+              RECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/dns_records?name=$SITE.${{ secrets.CF_DOMAIN }}" \
+                -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+                -H "Content-Type: application/json" | jq -r '.result[0].id // empty')
+              
+              if [ -n "$RECORD_ID" ]; then
+                curl -X DELETE "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/dns_records/$RECORD_ID" \
+                  -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}"
+                echo "✅ DNS deleted for $SITE"
+              else
+                echo "⏭️  No DNS found for $SITE"
+              fi
+            fi
+          done <<< "${{ steps.expired.outputs.sites }}"
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+
+      - name: Clean up GitHub Pages
+        if: steps.expired.outputs.sites != ''
+        run: |
+          git fetch origin gh-pages || true
+          git checkout gh-pages || exit 0
+          
+          while IFS= read -r SITE; do
+            if [ -n "$SITE" ] && [ -d "$SITE" ]; then
+              echo "🗑️  Removing $SITE from gh-pages"
+              git rm -rf "$SITE"
+            fi
+          done <<< "${{ steps.expired.outputs.sites }}"
+          
+          if git diff --staged --quiet; then
+            echo "Nothing to cleanup from gh-pages"
+          else
+            git commit -m "Cleanup expired sites from gh-pages"
+            git push origin gh-pages
+          fi
+          
+          git checkout main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
